@@ -3,6 +3,7 @@
 #include <TFT_eSPI.h>
 #include "driver.h"
 #include <math.h>
+#include <DFRobot_AS3935_I2C.h>
 
 // ── Display ───────────────────────────────────────────────────
 TFT_eSPI tft = TFT_eSPI();
@@ -23,7 +24,6 @@ TFT_eSprite spr = TFT_eSprite(&tft);
 #define C_GREY 0x4208
 
 // ── AS3935 ────────────────────────────────────────────────────
-#define AS3935_ADDR 3
 #define SENSE_INCREASE_INTERVAL 15000UL
 
 #if defined(D7)
@@ -38,14 +38,24 @@ constexpr uint32_t HISTORY_RESET_TOUCH_MS = 2000UL;
 constexpr uint32_t DEVICE_RESET_TOUCH_MS = 5000UL;
 
 constexpr uint8_t AS3935_TUNING_CAPACITANCE = 96;
-constexpr uint8_t AS3935_INDOOR_AFE = 0x24;
-constexpr uint8_t AS3935_OUTDOOR_AFE = 0x1C;
+constexpr bool AS3935_ANTENNA_TUNING_MODE = true;
+#define AS3935_INDOORS  0
+#define AS3935_OUTDOORS 1
+#define AS3935_DIST_EN  1
+#define AS3935_DIST_DIS 0
 
 #if defined(D2)
 constexpr uint8_t AS3935_IRQ_PIN = D2;
 #else
-constexpr uint8_t AS3935_IRQ_PIN = 2;
+constexpr uint8_t AS3935_IRQ_PIN = 4;
 #endif
+
+// Address resolved at runtime — start with ADD1, overridden in initAs3935()
+DFRobot_AS3935_I2C lightning(AS3935_IRQ_PIN, AS3935_ADD1);
+
+// I2C pin pairs to try: Round Display (9,8) then bare XIAO (6,7)
+static const uint8_t I2C_SDA_OPTS[] = {9, 6};
+static const uint8_t I2C_SCL_OPTS[] = {8, 7};
 
 uint8_t noiseFloor = 2;
 uint8_t watchdog = 2;
@@ -74,102 +84,68 @@ void clearHistory();
 void handleTouch();
 
 // ── AS3935 helpers ────────────────────────────────────────────
-uint8_t readReg(uint8_t reg)
+static uint8_t g_i2c_sda = 6;
+static uint8_t g_i2c_scl = 7;
+
+bool initAs3935()
 {
-  Wire.beginTransmission(AS3935_ADDR);
-  Wire.write(reg);
-  Wire.endTransmission(false);
-  Wire.requestFrom(AS3935_ADDR, 1);
-  return Wire.available() ? Wire.read() : 0xFF;
+  const uint8_t addrs[] = {AS3935_ADD1, AS3935_ADD2, AS3935_ADD3};
+  for (uint8_t pi = 0; pi < 2; pi++)
+  {
+    g_i2c_sda = I2C_SDA_OPTS[pi];
+    g_i2c_scl = I2C_SCL_OPTS[pi];
+    Wire.begin(g_i2c_sda, g_i2c_scl);
+    Wire.setClock(50000);
+    Serial.print("[I2C] Trying SDA=");
+    Serial.print(g_i2c_sda);
+    Serial.print(" SCL=");
+    Serial.println(g_i2c_scl);
+
+    for (uint8_t addr : addrs)
+    {
+      lightning.setI2CAddress(addr);
+      if (lightning.begin() == 0)
+      {
+        Wire.begin(g_i2c_sda, g_i2c_scl);
+        Wire.setClock(50000);
+        Serial.print("[AS3935] Found at 0x");
+        Serial.println(addr, HEX);
+        return true;
+      }
+      Wire.begin(g_i2c_sda, g_i2c_scl);
+      Wire.setClock(50000);
+    }
+  }
+  return false;
 }
 
-void writeReg(uint8_t reg, uint8_t val)
+void rewireI2C()
 {
-  Wire.beginTransmission(AS3935_ADDR);
-  Wire.write(reg);
-  Wire.write(val);
-  Wire.endTransmission(true);
-}
-
-void maskWrite(uint8_t reg, uint8_t mask, uint8_t val)
-{
-  writeReg(reg, (readReg(reg) & ~mask) | (val & mask));
-}
-
-bool probeAs3935()
-{
-  Wire.beginTransmission(AS3935_ADDR);
-  Wire.write(0x00);
-  if (Wire.endTransmission(false) != 0)
-    return false;
-
-  return Wire.requestFrom((uint8_t)AS3935_ADDR, (uint8_t)2) == 2;
-}
-
-void resetAs3935Defaults()
-{
-  writeReg(0x3C, 0x96);
-  delay(2);
-}
-
-void calibrateAs3935Rco()
-{
-  writeReg(0x3D, 0x96);
-  delay(2);
-}
-
-void powerUpAs3935()
-{
-  maskWrite(0x00, 0x01, 0x00);
-  calibrateAs3935Rco();
-  maskWrite(0x08, 0x20, 0x20);
-  delay(2);
-  maskWrite(0x08, 0x20, 0x00);
-}
-
-void setAs3935IndoorMode(bool indoors)
-{
-  maskWrite(0x00, 0x3E, indoors ? AS3935_INDOOR_AFE : AS3935_OUTDOOR_AFE);
-}
-
-void setAs3935DisturberEnabled(bool enabled)
-{
-  maskWrite(0x03, 0x20, enabled ? 0x00 : 0x20);
-}
-
-void setAs3935IrqOutputSource(uint8_t source)
-{
-  uint8_t bits = 0x00;
-  if (source == 1)
-    bits = 0x20;
-  else if (source == 2)
-    bits = 0x40;
-  else if (source == 3)
-    bits = 0x80;
-
-  maskWrite(0x08, 0xE0, bits);
-}
-
-void setAs3935TuningCaps(uint8_t capacitancePf)
-{
-  uint8_t capBits = capacitancePf > 120 ? 0x0F : (capacitancePf >> 3);
-  maskWrite(0x08, 0x0F, capBits);
+  Wire.begin(g_i2c_sda, g_i2c_scl);
+  Wire.setClock(50000);
 }
 
 void configureAs3935()
 {
-  resetAs3935Defaults();
-  powerUpAs3935();
-  setAs3935IndoorMode(true);
-  setAs3935DisturberEnabled(true);
-  setAs3935IrqOutputSource(0);
-  delay(500);
-  setAs3935TuningCaps(AS3935_TUNING_CAPACITANCE);
+  lightning.defInit();
+  // manualCal: powerUp + indoor/outdoor + disturber + IRQ source + tuning caps
+  lightning.manualCal(AS3935_TUNING_CAPACITANCE, AS3935_INDOORS, AS3935_DIST_EN);
+
+  if (AS3935_ANTENNA_TUNING_MODE)
+  {
+    // Route resonance frequency / 16 to IRQ for scope-based antenna tuning.
+    lightning.setLcoFdiv(0);
+    lightning.setIRQOutputSource(3);
+  }
+
+  lightning.setNoiseFloorLvl(noiseFloor);
+  lightning.setWatchdogThreshold(watchdog);
+  lightning.setSpikeRejection(spikeRej);
 }
 
 uint32_t readEnergy()
 {
-  return ((uint32_t)(readReg(0x06) & 0x1F) << 16) | ((uint32_t)readReg(0x05) << 8) | readReg(0x04);
+  return lightning.getStrikeEnergyRaw();
 }
 
 void pushTick(uint32_t e)
@@ -256,8 +232,8 @@ void handleTouch()
 
 void applyWatchdogSpike()
 {
-  writeReg(0x01, (noiseFloor << 4) | (watchdog & 0x0F));
-  maskWrite(0x02, 0x0F, spikeRej & 0x0F);
+  lightning.setWatchdogThreshold(watchdog);
+  lightning.setSpikeRejection(spikeRej);
 }
 
 void increaseSensitivity()
@@ -311,7 +287,7 @@ void raiseNoiseFloor()
   if (noiseFloor < 7)
   {
     noiseFloor++;
-    maskWrite(0x01, 0x70, noiseFloor << 4);
+    lightning.setNoiseFloorLvl(noiseFloor);
     Serial.print("[NF] Raised to ");
     Serial.println(noiseFloor);
   }
@@ -325,27 +301,26 @@ void IRAM_ATTR onAs3935Interrupt()
 void handleAs3935Interrupt()
 {
   delay(5);
-  uint8_t intReg = readReg(0x03);
-  uint8_t reason = intReg & 0x0F;
+  uint8_t reason = lightning.getInterruptSrc();
 
-  if (reason == 0x01)
+  if (reason == 3)
   {
     Serial.println("[NH] Noise floor too high");
     raiseNoiseFloor();
     senseLastAdj = millis();
   }
-  else if (reason == 0x04)
+  else if (reason == 2)
   {
     Serial.println("[D] Disturber - tuning up");
     increaseSensitivity();
     senseLastAdj = millis();
   }
-  else if (reason == 0x08)
+  else if (reason == 1)
   {
-    uint32_t e = readEnergy();
-    uint8_t d = readReg(0x07) & 0x3F;
-    if (d == 0x00)
-      d = 0x01;
+    uint32_t e = lightning.getStrikeEnergyRaw();
+    uint8_t d = lightning.getLightningDistKm();
+    if (d == 0)
+      d = 1;
 
     strikeCount++;
     lastEnergy = e;
@@ -614,20 +589,17 @@ void setup()
 
   drawBoot("INITIALIZING...", C_GREY);
 
-  Wire.begin(6, 7);
-  Wire.setClock(400000);
   pinMode(TOUCH_INT_PIN, INPUT_PULLUP);
 
-  if (probeAs3935())
+  if (initAs3935())
   {
     drawBoot("FOUND!", C_GREEN);
-    Serial.println("[AS3935] Found!");
     delay(1200);
   }
   else
   {
     drawBoot("NOT FOUND", 0xF800);
-    Serial.println("[AS3935] Not found");
+    Serial.println("[AS3935] Not found on 0x01/0x02/0x03 — check wiring");
     while (true)
       delay(1000);
   }
@@ -640,11 +612,22 @@ void setup()
   applyWatchdogSpike();
 
   pinMode(AS3935_IRQ_PIN, INPUT);
-  attachInterrupt(digitalPinToInterrupt(AS3935_IRQ_PIN), onAs3935Interrupt, RISING);
+  if (!AS3935_ANTENNA_TUNING_MODE)
+  {
+    attachInterrupt(digitalPinToInterrupt(AS3935_IRQ_PIN), onAs3935Interrupt, RISING);
+  }
 
   senseLastAdj = millis();
 
-  Serial.print("[AS3935] Ready - IRQ on pin ");
+  Serial.print("[AS3935] ");
+  if (AS3935_ANTENNA_TUNING_MODE)
+  {
+    Serial.print("Antenna tuning mode - scope IRQ/GND, target 500/16 kHz +/- 3.5% on pin ");
+  }
+  else
+  {
+    Serial.print("Ready - IRQ on pin ");
+  }
   Serial.print(AS3935_IRQ_PIN);
   Serial.print(" cap=");
   Serial.print(AS3935_TUNING_CAPACITANCE);
